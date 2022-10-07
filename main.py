@@ -6,11 +6,14 @@ import seaborn as sns
 import matplotlib.pyplot as plt
 from statsmodels.tsa.deterministic import DeterministicProcess, CalendarFourier
 from xgboost import XGBClassifier, XGBRegressor
+import xgboost as xgb
 from sklearn.linear_model import LinearRegression
 from sklearn.tree import DecisionTreeRegressor, DecisionTreeClassifier
 from sklearn.model_selection import train_test_split
+from sklearn.feature_selection import SelectFromModel
 from sklearn.metrics import mean_absolute_error, r2_score, mean_squared_error
 from sklearn.metrics import balanced_accuracy_score, log_loss, roc_auc_score
+from time import time
 
 
 def read_data_simu():
@@ -139,13 +142,42 @@ def xgb_clf_cosupply(X, y, nlag=4, nlead=4):
     X_train, y_train = X_train.align(y_train, join='inner', axis=0)
     X_test, y_test = X_test.align(y_test, join='inner', axis=0)
     ## Learn model
-    model = XGBClassifier(objective='binary:logistic', max_depth=4, n_estimators=30)#'multi:softprob'
+    n_estimators = 100
+    max_depth = 5
+    params = {'silent': True,
+              'objective': 'binary:logistic',
+              'eta': 0.1,
+              'n_estimators': n_estimators,
+              'max_depth': max_depth}
+
+    ## Feature Selection
+    model = XGBClassifier(objective='binary:logistic', max_depth=max_depth, n_estimators=n_estimators)#'multi:softprob'
     model.fit(X_train, y_train)
+    importance = model.feature_importances_
+    feature_names = np.array(X_train.columns)
+    plt.bar(height=importance, x=feature_names)
+    plt.title("Feature importance score")
+    plt.show()
+    threshold = np.sort(importance)[-20] + 0.0001  # define number of wanted features !
+    tic = time()
+    sfm = SelectFromModel(model, threshold=threshold).fit(X_train, y_train)
+    toc = time()
+    selected_feat_idx = sfm.get_support()
+    print(f"Features selected by SelectFromModel: {feature_names[selected_feat_idx]}")
+    print(f"Done in {toc - tic:.3f}s")
+
+    ## Retrain model based on selected features
+    X_train = X_train.iloc[:, selected_feat_idx]
+    X_test = X_test.iloc[:, selected_feat_idx]
+    dtrain = xgb.DMatrix(X_train, y_train)
+    dtest = xgb.DMatrix(X_test, y_test)
+    model = xgb.train(params, dtrain, n_estimators)
+
     ## Add the predicted residuals onto the predicted trends
-    y_fit = model.predict(X_train)
-    y_pred = model.predict(X_test)
+    y_fit = model.predict(dtrain)
+    y_pred = model.predict(dtest)
     p_fit = model.predict_proba(X_train)
-    p_pred = model.predict_proba(X_test)
+    p_pred = model.predict_proba(dtest)
     e_train = pd.get_dummies(y_train).astype('float32')
     e_test = pd.get_dummies(y_test)
     e_test = e_test.reindex(columns=e_train.columns.to_list()).fillna(0).astype('float32')
