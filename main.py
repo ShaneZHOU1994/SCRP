@@ -9,11 +9,12 @@ from xgboost import XGBClassifier, XGBRegressor
 import xgboost as xgb
 from sklearn.linear_model import LinearRegression
 from sklearn.tree import DecisionTreeRegressor, DecisionTreeClassifier
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import train_test_split, GridSearchCV, StratifiedKFold
 from sklearn.feature_selection import SelectFromModel
 from sklearn.metrics import mean_absolute_error, r2_score, mean_squared_error
 from sklearn.metrics import balanced_accuracy_score, log_loss, roc_auc_score
 from time import time
+from datetime import datetime
 
 
 def read_data_simu():
@@ -132,27 +133,86 @@ def read_data_CoSupply(nskip=10000, nrow=10000):
     return X, y
 
 
-def xgb_clf_cosupply(X, y, nlag=4, nlead=4):
+def data_lag_split(X, y, nlag=4, nlead=4):
+    ## dataset split to training and testing :
     X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, shuffle=False)
-    ## Make lag features
+    ## Make lag features :
     X_train = make_lags(X_train, lags=nlag).fillna(0.0)
     X_test = make_lags(X_test, lags=nlag).fillna(0.0)
+    ## make lead features :
     y_train = y_train.shift(-nlead).dropna()
     y_test = y_test.shift(-nlead).dropna()
     X_train, y_train = X_train.align(y_train, join='inner', axis=0)
     X_test, y_test = X_test.align(y_test, join='inner', axis=0)
-    ## Learn model
-    n_estimators = 100
-    max_depth = 5
-    params = {'silent': True,
-              'objective': 'binary:logistic',
-              'eta': 0.1,
-              'n_estimators': n_estimators,
-              'max_depth': max_depth}
+    return X_train, X_test, y_train, y_test
 
-    ## Feature Selection
-    model = XGBClassifier(objective='binary:logistic', max_depth=max_depth, n_estimators=n_estimators)#'multi:softprob'
-    model.fit(X_train, y_train)
+
+def train_CV_xgb_clf(X_train, y_train):
+    ## Iteration of cross-validated param tuning :
+    n_estimators = 200
+    params1 = {'silent': True,
+              'obj': 'binary:logistic',
+              "subsample": 1,
+              "max_depth": 5,
+              "eta": 0.3,
+              "gamma": 0,
+              "lambda": 1,
+              "alpha": 0,
+              "colsample_bytree": 1,
+              "colsample_bylevel": 1,
+              "colsample_bynode": 1,
+              "nfold": 5
+              }
+    params2 = {'silent': True,
+              'obj': 'binary:logistic',
+              "subsample": 0.6,
+              "max_depth": 4,
+              "eta": 0.02,
+              "gamma": 2,
+              "lambda": 1,
+              "alpha": 0,
+              "colsample_bytree": 1,
+              "colsample_bylevel": 1,
+              "colsample_bynode": 1,
+              "nfold": 5
+              }
+    dtrain = xgb.DMatrix(X_train, y_train)
+
+    time0 = time()
+    cvresult1 = xgb.cv(params1, dtrain, n_estimators)
+    print(time() - time0, 's')
+    time0 = time()
+    cvresult2 = xgb.cv(params2, dtrain, n_estimators)
+    print(time() - time0, 's')
+    fig, ax = plt.subplots(1, figsize=(15, 10))
+    # ax.set_ylim(top=5)
+    ax.grid()
+    ax.plot(range(1, 1+n_estimators), cvresult1.iloc[:, 0], c="red", label="train,control")
+    ax.plot(range(1, 1+n_estimators), cvresult1.iloc[:, 2], c="orange", label="test,control")
+    ax.plot(range(1, 1 + n_estimators), cvresult2.iloc[:, 0], c="green", label="train,exp")
+    ax.plot(range(1, 1 + n_estimators), cvresult2.iloc[:, 2], c="blue", label="test,exp")
+    ax.legend(fontsize="xx-large")
+    plt.show()
+    ## param tuned :
+    model = xgb.train(params2, dtrain, n_estimators)
+    return model, params, n_estimators
+
+
+def train_gridsearch_xgb_clf(X_train, y_train):
+    clf = XGBClassifier(objective= 'binary:logistic', nthread=4, seed=42)
+    param_grid = {
+        'max_depth': range(2, 6, 1),
+        'n_estimators': range(20, 200, 40),
+        'learning_rate': [0.1, 0.01, 0.05]
+    }
+    grid_search = GridSearchCV(clf, param_grid=param_grid, scoring='roc_auc', n_jobs=5, cv=5, verbose=True)
+    grid_search.fit(X_train, y_train)
+    model = grid_search.best_estimator_
+    params = grid_search.best_params_
+    return model, params, params['max_depth']
+
+
+def retrain_on_feat_select_by_model(model, params, n_estimators, X_train, X_test, y_train):
     importance = model.feature_importances_
     feature_names = np.array(X_train.columns)
     plt.bar(height=importance, x=feature_names)
@@ -166,108 +226,17 @@ def xgb_clf_cosupply(X, y, nlag=4, nlead=4):
     print(f"Features selected by SelectFromModel: {feature_names[selected_feat_idx]}")
     print(f"Done in {toc - tic:.3f}s")
 
-    ## Retrain model based on selected features
+    ## Retrain model based on selected feats :
     X_train = X_train.iloc[:, selected_feat_idx]
     X_test = X_test.iloc[:, selected_feat_idx]
-    dtrain = xgb.DMatrix(X_train, y_train)
-    dtest = xgb.DMatrix(X_test, y_test)
-    model = xgb.train(params, dtrain, n_estimators)
-
-    ## Add the predicted residuals onto the predicted trends
-    y_fit = model.predict(dtrain)
-    y_pred = model.predict(dtest)
-    p_fit = model.predict_proba(X_train)
-    p_pred = model.predict_proba(dtest)
-    e_train = pd.get_dummies(y_train).astype('float32')
-    e_test = pd.get_dummies(y_test)
-    e_test = e_test.reindex(columns=e_train.columns.to_list()).fillna(0).astype('float32')
-    y_train = np.array(y_train).ravel()
-    y_test = np.array(y_test).ravel()
-    return y_train, y_test, y_fit, y_pred, e_train, e_test, p_fit, p_pred
+    # dtrain = xgb.DMatrix(X_train, y_train)
+    # dtest = xgb.DMatrix(X_test, y_test)
+    # model = xgb.train(params, dtrain, n_estimators)  # learning API
+    model = XGBClassifier(**params).fit(X_train, y_train)  # sklearn API
+    return model, X_train, X_test#, dtrain, dtest
 
 
-def read_data_SCRM(n0=1, n1=500000, nstep=100000):
-    ## SCRM data preprocessing :
-    hr = pd.read_csv('SCRM/SCRM_timeSeries_2018_train.csv', parse_dates=['Timestamp'], infer_datetime_format=True,
-                     skiprows=range(1, n0), nrows=n1)
-    hrt = pd.read_csv('SCRM/SCRM_timeSeries_2018_train.csv', parse_dates=['Timestamp'], infer_datetime_format=True,
-                      skiprows=range(1, n0+n1), nrows=nstep)
-    # hr['Datetime_parsed'] = pd.to_datetime(hr['Timestamp'], format='%Y/%m/%d', infer_datetime_format=True)
-    print(hr.dtypes)
-    hr.Timestamp = hr.Timestamp.dt.to_period('H')
-    # print(hr.head(20))
-    # print('\n'+'-'*20)
-    # print(hr.describe())
-    return hr, hrt, nstep
-
-
-def trend_model_SCRM(hr, hrt, nstep, nlead=4):
-    y_train = hr.Total_Cost.fillna(0).shift(-nlead).fillna(0) #SCMstability_category
-    dp = DeterministicProcess(index=y_train.index, constant=True, order=0, drop=True)#,
-                              # seasonal=True, additional_terms=[CalendarFourier(freq='S', order=4)])
-    X_train = dp.in_sample()
-    y_test = hrt.Total_Cost.fillna(0).shift(-nlead).fillna(0)
-    X_test = dp.out_of_sample(steps=nstep)
-    y_test.index = X_test.index  # Align test target with test data 'future'
-    ## It will be easier for us later if we split the date index instead of the dataframe directly.
-    # idx_train, idx_test = train_test_split(y.index, test_size=0.2, shuffle=False)
-    # X_train, X_test = X.loc[idx_train, :], X.loc[idx_test, :]
-    # y_train, y_test = y.loc[idx_train], y.loc[idx_test]
-    ## Fit trend model
-    model1 = LinearRegression(fit_intercept=False)
-    model1.fit(X_train, y_train)
-    ## Make predictions
-    y_fit = pd.DataFrame(model1.predict(X_train), index=y_train.index)
-    y_pred = pd.DataFrame(model1.predict(X_test), index=y_test.index)
-    ## Plot
-    axs = y_train.plot(color='0.25', subplots=True, sharex=True)
-    axs = y_test.plot(color='0.25', subplots=True, sharex=True, ax=axs)
-    axs = y_fit.plot(color='C0', subplots=True, sharex=True, ax=axs)
-    axs = y_pred.plot(color='C3', subplots=True, sharex=True, ax=axs)
-    for ax in axs: ax.legend([])
-    _ = plt.suptitle("Trends")
-    # plot_periodogram(hr.Total_Cost)
-    plt.show()
-    return X_train, y_train, X_test, y_test, model1, y_fit, y_pred
-
-
-def xgb_reg_SCRM(hr, hrt, y_train, y_test, y_fit, y_pred, nlag=4):
-    ## Make lag features
-    X = make_lags(hr.drop(columns=['Timestamp', 'SCMstability_category', 'Total_Cost'], axis=1), lags=nlag).fillna(0.0)
-    Xt = make_lags(hrt.drop(columns=['Timestamp', 'SCMstability_category', 'Total_Cost'], axis=1), lags=nlag).fillna(0.0)
-    # X = pd.concat([make_lags(pd.DataFrame(hr.Total_Cost.fillna(0), columns=['Total_Cost']), lags=nlag),
-    #                hr.drop(columns=['Timestamp', 'SCMstability_category', 'Total_Cost'], axis=1)], axis=1)
-    # Xt = pd.concat([make_lags(pd.DataFrame(hrt.Total_Cost.fillna(0), columns=['Total_Cost']), lags=nlag),
-    #                hrt.drop(columns=['Timestamp', 'SCMstability_category', 'Total_Cost'], axis=1)], axis=1)
-    X_train, y_train = X.align(y_train, join='inner', axis=0)
-    X_test = Xt
-    X_test.index = y_test.index
-    # # X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, shuffle=False)
-    ## Pivot wide to long (stack) and convert DataFrame to Series (squeeze)
-    y_fit = y_fit.squeeze()    # trend from training set
-    y_pred = y_pred.squeeze()  # trend from test set
-    ## Learn residual
-    y_res = y_train - y_fit
-    model2 = XGBRegressor(max_depth=5, n_estimators=100)
-    model2.fit(X_train, y_res)
-    ## Add the predicted residuals onto the predicted trends
-    y_fit_boosted = model2.predict(X_train) + y_fit
-    y_pred_boosted = model2.predict(X_test) + y_pred
-    return y_fit_boosted, y_pred_boosted
-
-
-def xgb_clf_SCRM(hr, hrt, nlag=4, nlead=4):
-    ## Make lag features
-    X_train = make_lags(hr.drop(columns=['Timestamp', 'SCMstability_category'], axis=1), lags=nlag).fillna(0.0)
-    X_test = make_lags(hrt.drop(columns=['Timestamp', 'SCMstability_category'], axis=1), lags=nlag).fillna(0.0)
-    y_train = hr['SCMstability_category'].shift(-nlead).dropna()
-    y_test = hrt['SCMstability_category'].shift(-nlead).dropna()
-    X_train, y_train = X_train.align(y_train, join='inner', axis=0)
-    X_test, y_test = X_test.align(y_test, join='inner', axis=0)
-    ## Learn model
-    model = XGBClassifier(objective='multi:softprob', max_depth=6, n_estimators=100)
-    model.fit(X_train, y_train)
-    ## Add the predicted residuals onto the predicted trends
+def xgb_clf_predict(model, X_train, X_test, y_train, y_test):
     y_fit = model.predict(X_train)
     y_pred = model.predict(X_test)
     p_fit = model.predict_proba(X_train)
@@ -278,6 +247,100 @@ def xgb_clf_SCRM(hr, hrt, nlag=4, nlead=4):
     y_train = np.array(y_train).ravel()
     y_test = np.array(y_test).ravel()
     return y_train, y_test, y_fit, y_pred, e_train, e_test, p_fit, p_pred
+
+#
+# def read_data_SCRM(n0=1, n1=500000, nstep=100000):
+#     ## SCRM data preprocessing :
+#     hr = pd.read_csv('SCRM/SCRM_timeSeries_2018_train.csv', parse_dates=['Timestamp'], infer_datetime_format=True,
+#                      skiprows=range(1, n0), nrows=n1)
+#     hrt = pd.read_csv('SCRM/SCRM_timeSeries_2018_train.csv', parse_dates=['Timestamp'], infer_datetime_format=True,
+#                       skiprows=range(1, n0+n1), nrows=nstep)
+#     # hr['Datetime_parsed'] = pd.to_datetime(hr['Timestamp'], format='%Y/%m/%d', infer_datetime_format=True)
+#     print(hr.dtypes)
+#     hr.Timestamp = hr.Timestamp.dt.to_period('H')
+#     # print(hr.head(20))
+#     # print('\n'+'-'*20)
+#     # print(hr.describe())
+#     return hr, hrt, nstep
+#
+#
+# def trend_model_SCRM(hr, hrt, nstep, nlead=4):
+#     y_train = hr.Total_Cost.fillna(0).shift(-nlead).fillna(0) #SCMstability_category
+#     dp = DeterministicProcess(index=y_train.index, constant=True, order=0, drop=True)#,
+#                               # seasonal=True, additional_terms=[CalendarFourier(freq='S', order=4)])
+#     X_train = dp.in_sample()
+#     y_test = hrt.Total_Cost.fillna(0).shift(-nlead).fillna(0)
+#     X_test = dp.out_of_sample(steps=nstep)
+#     y_test.index = X_test.index  # Align test target with test data 'future'
+#     ## It will be easier for us later if we split the date index instead of the dataframe directly.
+#     # idx_train, idx_test = train_test_split(y.index, test_size=0.2, shuffle=False)
+#     # X_train, X_test = X.loc[idx_train, :], X.loc[idx_test, :]
+#     # y_train, y_test = y.loc[idx_train], y.loc[idx_test]
+#     ## Fit trend model
+#     model1 = LinearRegression(fit_intercept=False)
+#     model1.fit(X_train, y_train)
+#     ## Make predictions
+#     y_fit = pd.DataFrame(model1.predict(X_train), index=y_train.index)
+#     y_pred = pd.DataFrame(model1.predict(X_test), index=y_test.index)
+#     ## Plot
+#     axs = y_train.plot(color='0.25', subplots=True, sharex=True)
+#     axs = y_test.plot(color='0.25', subplots=True, sharex=True, ax=axs)
+#     axs = y_fit.plot(color='C0', subplots=True, sharex=True, ax=axs)
+#     axs = y_pred.plot(color='C3', subplots=True, sharex=True, ax=axs)
+#     for ax in axs: ax.legend([])
+#     _ = plt.suptitle("Trends")
+#     # plot_periodogram(hr.Total_Cost)
+#     plt.show()
+#     return X_train, y_train, X_test, y_test, model1, y_fit, y_pred
+#
+#
+# def xgb_reg_SCRM(hr, hrt, y_train, y_test, y_fit, y_pred, nlag=4):
+#     ## Make lag features
+#     X = make_lags(hr.drop(columns=['Timestamp', 'SCMstability_category', 'Total_Cost'], axis=1), lags=nlag).fillna(0.0)
+#     Xt = make_lags(hrt.drop(columns=['Timestamp', 'SCMstability_category', 'Total_Cost'], axis=1), lags=nlag).fillna(0.0)
+#     # X = pd.concat([make_lags(pd.DataFrame(hr.Total_Cost.fillna(0), columns=['Total_Cost']), lags=nlag),
+#     #                hr.drop(columns=['Timestamp', 'SCMstability_category', 'Total_Cost'], axis=1)], axis=1)
+#     # Xt = pd.concat([make_lags(pd.DataFrame(hrt.Total_Cost.fillna(0), columns=['Total_Cost']), lags=nlag),
+#     #                hrt.drop(columns=['Timestamp', 'SCMstability_category', 'Total_Cost'], axis=1)], axis=1)
+#     X_train, y_train = X.align(y_train, join='inner', axis=0)
+#     X_test = Xt
+#     X_test.index = y_test.index
+#     # # X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, shuffle=False)
+#     ## Pivot wide to long (stack) and convert DataFrame to Series (squeeze)
+#     y_fit = y_fit.squeeze()    # trend from training set
+#     y_pred = y_pred.squeeze()  # trend from test set
+#     ## Learn residual
+#     y_res = y_train - y_fit
+#     model2 = XGBRegressor(max_depth=5, n_estimators=100)
+#     model2.fit(X_train, y_res)
+#     ## Add the predicted residuals onto the predicted trends
+#     y_fit_boosted = model2.predict(X_train) + y_fit
+#     y_pred_boosted = model2.predict(X_test) + y_pred
+#     return y_fit_boosted, y_pred_boosted
+#
+#
+# def xgb_clf_SCRM(hr, hrt, nlag=4, nlead=4):
+#     ## Make lag features
+#     X_train = make_lags(hr.drop(columns=['Timestamp', 'SCMstability_category'], axis=1), lags=nlag).fillna(0.0)
+#     X_test = make_lags(hrt.drop(columns=['Timestamp', 'SCMstability_category'], axis=1), lags=nlag).fillna(0.0)
+#     y_train = hr['SCMstability_category'].shift(-nlead).dropna()
+#     y_test = hrt['SCMstability_category'].shift(-nlead).dropna()
+#     X_train, y_train = X_train.align(y_train, join='inner', axis=0)
+#     X_test, y_test = X_test.align(y_test, join='inner', axis=0)
+#     ## Learn model
+#     model = XGBClassifier(objective='multi:softprob', max_depth=6, n_estimators=100)
+#     model.fit(X_train, y_train)
+#     ## Add the predicted residuals onto the predicted trends
+#     y_fit = model.predict(X_train)
+#     y_pred = model.predict(X_test)
+#     p_fit = model.predict_proba(X_train)
+#     p_pred = model.predict_proba(X_test)
+#     e_train = pd.get_dummies(y_train).astype('float32')
+#     e_test = pd.get_dummies(y_test)
+#     e_test = e_test.reindex(columns=e_train.columns.to_list()).fillna(0).astype('float32')
+#     y_train = np.array(y_train).ravel()
+#     y_test = np.array(y_test).ravel()
+#     return y_train, y_test, y_fit, y_pred, e_train, e_test, p_fit, p_pred
 
 
 def eval_reg_result(y_train, y_test, y_fit_boosted, y_pred_boosted):
@@ -321,14 +384,17 @@ def eval_clf_result(y_train, y_test, y_fit, y_pred, e_train, e_test, p_fit, p_pr
 if __name__ == '__main__':
     # hr = read_data_simu()
     # X, y = calcul_risk_simu(hr)
-    # y_train, y_test, y_fit, y_pred, e_train, e_test, p_fit, p_pred = xgb_clf_cosupply(X, y, nlag=3, nlead=1)
-    # eval_clf_result(y_train, y_test, y_fit, y_pred, e_train, e_test, p_fit, p_pred)
+
     # pass
 
     ## CoSupply dataset:
     # prep_data_CoSupply()
     X, y = read_data_CoSupply(nskip=10000, nrow=2000)
-    y_train, y_test, y_fit, y_pred, e_train, e_test, p_fit, p_pred = xgb_clf_cosupply(X, y, nlag=5, nlead=1)
+    X_train, X_test, y_train, y_test = data_lag_split(X, y, nlag=5, nlead=1)
+    # model, params, n_estimators = train_CV_xgb_clf(X_train, y_train)
+    model, params, n_estimators = train_gridsearch_xgb_clf(X_train, y_train)
+    model, X_train, X_test = retrain_on_feat_select_by_model(model, params, n_estimators, X_train, X_test, y_train)
+    y_train, y_test, y_fit, y_pred, e_train, e_test, p_fit, p_pred = xgb_clf_predict(model, X_train, X_test, y_train, y_test)
     eval_clf_result(y_train, y_test, y_fit, y_pred, e_train, e_test, p_fit, p_pred)
 
     ## SCRM dataset:
